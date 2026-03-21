@@ -1,0 +1,19 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "deploy/Dockerfile"
+
+[deploy]
+startCommand = "python -m bot.main"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Environment variables (set in Railway dashboard, not here)
+# TELEGRAM_BOT_TOKEN
+# DEEPSEEK_API_KEY
+# etc.
+
+[volumes]
+# Mount /data as persistent volume for SQLite
+data = "/data"
