@@ -9,7 +9,7 @@ import threading
 
 import uvicorn
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-
+from telegram import Update 
 from bot.config import Settings, router
 from bot.agent.memory import memory
 from bot.telegram.handlers import start, help_command, status, handle_message
