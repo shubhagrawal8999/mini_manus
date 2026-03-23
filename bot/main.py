@@ -5,6 +5,9 @@ Initializes all components and starts polling.
 
 import asyncio
 import logging
+import threading
+
+import uvicorn
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from bot.config import Settings, router
@@ -50,8 +53,20 @@ async def post_shutdown(application: Application):
     await router.close()
     logger.info("Shutdown complete")
 
+def start_health_server():
+    """Run the FastAPI health server in a background thread."""
+    from bot.api import app
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+
+
 def main():
     """Start the bot."""
+
+    # Start health server in background thread so Railway's healthcheck passes
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    logger.info("Health server started on port 8000")
+
     
     # Validate before starting
     missing = Settings.validate()
