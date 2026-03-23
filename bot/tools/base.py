@@ -4,7 +4,7 @@ Ensures consistent interface and error handling.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List
+from typing import Dict, Any, List,Optional, Literal
 from pydantic import BaseModel, ValidationError
 
 class ToolResult(BaseModel):
