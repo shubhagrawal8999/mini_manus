@@ -1,17 +1,34 @@
 """
 Configuration and Model Routing.
-Handles API keys, retry logic, and cost-optimized model selection.
+
+BUG FIXED:
+  Circuit breaker reset logic was inverted:
+    if self.deepseek_failures > 0 and not self.circuit_open:
+        self.deepseek_failures = 0
+  This reset the failure counter BEFORE the circuit ever opened, and once the
+  circuit opened it could never reset (because the condition required
+  `not self.circuit_open`).
+
+  Fix: reset both `deepseek_failures` AND `circuit_open` on a successful call
+  so DeepSeek can recover after a transient outage.
 """
 
-import os
 import asyncio
+import os
 from dataclasses import dataclass
 from typing import Optional, Literal, List, Dict, Any
+
 from openai import AsyncOpenAI, RateLimitError, APIError, Timeout
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 @dataclass
 class ModelConfig:
@@ -23,67 +40,67 @@ class ModelConfig:
     max_tokens: int
     is_reasoning: bool = False
 
+
 class Settings:
-    """Centralized configuration with validation."""
-    
-    # API Keys
-    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-    
-    # Paths
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/agent.db")
-    ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    
-    # Gmail
-    GMAIL_USER = os.getenv("GMAIL_USER", "")
-    GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-    
+    """Centralised configuration with validation."""
+
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    ADMIN_USER_ID: int = int(os.getenv("ADMIN_USER_ID", "0"))
+
+    DATABASE_PATH: str = os.getenv("DATABASE_PATH", "/data/agent.db")
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+    GMAIL_USER: str = os.getenv("GMAIL_USER", "")
+    GMAIL_APP_PASSWORD: str = os.getenv("GMAIL_APP_PASSWORD", "")
+
+    LINKEDIN_ACCESS_TOKEN: str = os.getenv("LINKEDIN_ACCESS_TOKEN", "")
+    LINKEDIN_PERSON_URN: str = os.getenv("LINKEDIN_PERSON_URN", "")
+
     @classmethod
     def validate(cls) -> List[str]:
-        """Return list of missing required settings."""
         missing = []
         if not cls.DEEPSEEK_API_KEY:
             missing.append("DEEPSEEK_API_KEY")
         if not cls.TELEGRAM_BOT_TOKEN:
             missing.append("TELEGRAM_BOT_TOKEN")
         if not cls.ADMIN_USER_ID:
-            missing.append("ADMIN_USER_ID (your Telegram ID)")
+            missing.append("ADMIN_USER_ID (your Telegram numeric ID)")
         return missing
+
 
 class ModelRouter:
     """
-    Cost-optimized model routing with circuit breaker pattern.
-    DeepSeek primary (cheap), OpenAI fallback (reliable).
+    Cost-optimised routing with circuit breaker.
+    DeepSeek is primary (cheap); OpenAI is the fallback.
     """
-    
+
+    MAX_FAILURES_BEFORE_FALLBACK = 3
+
     def __init__(self):
         self.deepseek = AsyncOpenAI(
             api_key=Settings.DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com",
-            timeout=60.0  # Longer timeout for reasoning
+            timeout=60.0,
         )
         self.openai = AsyncOpenAI(
             api_key=Settings.OPENAI_API_KEY,
-            timeout=30.0
+            timeout=30.0,
         )
-        
-        # Circuit breaker state
+
         self.deepseek_failures = 0
-        self.circuit_open = False
-        self.max_failures_before_fallback = 3
-        
-        self.models = {
+        self.circuit_open = False  # True = skip DeepSeek, use OpenAI
+
+        self.models: Dict[str, ModelConfig] = {
             "deepseek_chat": ModelConfig(
                 name="deepseek-chat",
                 client=self.deepseek,
                 model_id="deepseek-chat",
-                cost_per_1k_input=0.0001,  # $0.0001 per 1K tokens
+                cost_per_1k_input=0.0001,
                 cost_per_1k_output=0.0002,
                 max_tokens=4096,
-                is_reasoning=False
             ),
             "deepseek_reasoner": ModelConfig(
                 name="deepseek-reasoner",
@@ -92,57 +109,47 @@ class ModelRouter:
                 cost_per_1k_input=0.0005,
                 cost_per_1k_output=0.0016,
                 max_tokens=8192,
-                is_reasoning=True
+                is_reasoning=True,
             ),
             "gpt4o_mini": ModelConfig(
                 name="gpt-4o-mini",
                 client=self.openai,
                 model_id="gpt-4o-mini",
-                cost_per_1k_input=0.0006,
-                cost_per_1k_output=0.0009,
+                cost_per_1k_input=0.00015,
+                cost_per_1k_output=0.0006,
                 max_tokens=4096,
-                is_reasoning=False
-            )
+            ),
         }
-    
-    def select_model(self, complexity: Literal["simple", "medium", "complex", "reasoning"]) -> ModelConfig:
-        """
-        Select model based on complexity and circuit state.
-        """
-        # If circuit open (DeepSeek failing), use OpenAI
+
+    def select_model(
+        self, complexity: Literal["simple", "medium", "complex", "reasoning"]
+    ) -> ModelConfig:
         if self.circuit_open and Settings.OPENAI_API_KEY:
             return self.models["gpt4o_mini"]
-        
-        if complexity == "simple":
+
+        if complexity in ("simple", "medium"):
             return self.models["deepseek_chat"]
-        elif complexity == "medium":
-            return self.models["deepseek_chat"]
-        elif complexity == "complex":
-            return self.models["deepseek_reasoner"]
-        else:  # reasoning fallback
-            return self.models["deepseek_reasoner"] if not self.circuit_open else self.models["gpt4o_mini"]
-    
+        return self.models["deepseek_reasoner"]
+
     @retry(
         stop=stop_after_attempt(4),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((RateLimitError, APIError, Timeout, asyncio.TimeoutError)),
-        reraise=True
+        retry=retry_if_exception_type(
+            (RateLimitError, APIError, Timeout, asyncio.TimeoutError)
+        ),
+        reraise=True,
     )
     async def call(
-        self, 
-        messages: List[Dict[str, str]], 
+        self,
+        messages: List[Dict[str, str]],
         complexity: Literal["simple", "medium", "complex", "reasoning"] = "medium",
         tools: Optional[List[Dict]] = None,
-        temperature: float = 0.7
+        temperature: float = 0.7,
     ) -> Dict[str, Any]:
-        """
-        Call LLM with automatic retries and circuit breaker.
-        """
         model = self.select_model(complexity)
-        
+
         try:
-            # Prepare parameters
-            params = {
+            params: Dict[str, Any] = {
                 "model": model.model_id,
                 "messages": messages,
                 "max_tokens": model.max_tokens,
@@ -151,21 +158,20 @@ class ModelRouter:
             if tools:
                 params["tools"] = tools
                 params["tool_choice"] = "auto"
-            
-            # Execute
+
             response = await model.client.chat.completions.create(**params)
-            
-            # Reset circuit on success
-            if self.deepseek_failures > 0 and not self.circuit_open:
-                self.deepseek_failures = 0
-            
-            # Calculate cost
+
+            # BUG FIX: reset circuit on ANY successful call, regardless of
+            # whether the circuit was open.
+            self.deepseek_failures = 0
+            self.circuit_open = False
+
             usage = response.usage
             cost = (
-                (usage.prompt_tokens * model.cost_per_1k_input / 1000) +
-                (usage.completion_tokens * model.cost_per_1k_output / 1000)
+                usage.prompt_tokens * model.cost_per_1k_input / 1000
+                + usage.completion_tokens * model.cost_per_1k_output / 1000
             )
-            
+
             return {
                 "success": True,
                 "content": response.choices[0].message,
@@ -173,33 +179,34 @@ class ModelRouter:
                     "prompt_tokens": usage.prompt_tokens,
                     "completion_tokens": usage.completion_tokens,
                     "total_tokens": usage.total_tokens,
-                    "cost_usd": round(cost, 6)
+                    "cost_usd": round(cost, 6),
                 },
-                "model": model.name
+                "model": model.name,
             }
-            
-        except (RateLimitError, APIError, Timeout, asyncio.TimeoutError) as e:
-            # Count failures for circuit breaker
-            if "deepseek" in str(e).lower():
+
+        except (RateLimitError, APIError, Timeout, asyncio.TimeoutError) as exc:
+            # Only count failures against DeepSeek (not OpenAI)
+            if "deepseek" in model.name.lower():
                 self.deepseek_failures += 1
-                if self.deepseek_failures >= self.max_failures_before_fallback:
+                if self.deepseek_failures >= self.MAX_FAILURES_BEFORE_FALLBACK:
                     self.circuit_open = True
-                    print(f"CIRCUIT BREAKER OPEN: DeepSeek failing, falling back to OpenAI")
-            
-            raise  # Let tenacity retry
-        
-        except Exception as e:
-            # Non-retryable error
+                    print(
+                        f"[CircuitBreaker] OPEN — DeepSeek failed "
+                        f"{self.deepseek_failures}x, falling back to OpenAI"
+                    )
+            raise  # let tenacity retry
+
+        except Exception as exc:
             return {
                 "success": False,
-                "error": str(e),
-                "error_type": type(e).__name__
+                "error": str(exc),
+                "error_type": type(exc).__name__,
             }
-    
+
     async def close(self):
-        """Cleanup connections."""
         await self.deepseek.close()
         await self.openai.close()
 
-# Global instance
+
+# Singletons
 router = ModelRouter()
