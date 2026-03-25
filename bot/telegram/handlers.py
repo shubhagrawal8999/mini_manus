@@ -116,6 +116,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text
 
     await update.message.chat.send_action(action="typing")
+    lower_text = (message_text or "").lower()
+    likely_long_task = any(
+        kw in lower_text
+        for kw in [
+            "research",
+            "search",
+            "linkedin",
+            "email",
+            "schedule",
+            "whatsapp",
+            "post",
+            "send",
+        ]
+    )
+    if likely_long_task:
+        await safe_reply(
+            update,
+            "⏳ I am working on your request. This may take 2 to 3 minutes.",
+        )
 
     try:
         result = await orchestrator.process(user_id, message_text)

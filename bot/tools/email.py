@@ -1,26 +1,17 @@
 """
-Email automation using yagmail.
+Email automation via Gmail SMTP.
 Requires GMAIL_USER and GMAIL_APP_PASSWORD in env.
 
-BUG FIXED:
-  yagmail.send() is a blocking synchronous SMTP call.  Calling it directly
-  inside `async def execute()` froze the entire bot event loop until the
-  SMTP transaction completed (or timed out).
-  Fix: wrapped in asyncio.to_thread() so it runs in a thread pool without
-  blocking other Telegram updates.
-
-SETUP CHECKLIST (Gmail):
-  1. Enable 2-Step Verification on your Google account.
-  2. Go to Google Account → Security → App Passwords.
-  3. Generate a password for "Mail" / "Other".
-  4. Put that 16-char password in GMAIL_APP_PASSWORD (no spaces).
-  5. GMAIL_USER should be your full address, e.g. you@gmail.com
+WHY THIS VERSION:
+  Some deployments fail with yagmail/keyring backend issues in headless
+  containers. This implementation uses Python's built-in SMTP stack
+  directly, making behavior predictable across local + Railway/Docker.
 """
 
 import asyncio
+import smtplib
+from email.message import EmailMessage
 from typing import Literal
-
-import yagmail
 
 from bot.config import Settings
 from bot.tools.base import Tool, ToolResult
@@ -58,21 +49,8 @@ class EmailTool(Tool):
     }
 
     def __init__(self):
-        self._yag: yagmail.SMTP | None = None
         self._setup_error: str = ""
-
-        if Settings.GMAIL_USER and Settings.GMAIL_APP_PASSWORD:
-            try:
-                # yagmail.SMTP() just stores credentials; it doesn't open a
-                # connection here, so this is safe to call synchronously.
-                self._yag = yagmail.SMTP(
-                    user=Settings.GMAIL_USER,
-                    password=Settings.GMAIL_APP_PASSWORD,
-                )
-            except Exception as exc:
-                self._setup_error = str(exc)
-                print(f"[EmailTool] Setup failed: {exc}")
-        else:
+        if not (Settings.GMAIL_USER and Settings.GMAIL_APP_PASSWORD):
             self._setup_error = "GMAIL_USER or GMAIL_APP_PASSWORD not set in environment."
 
     # ------------------------------------------------------------------
@@ -121,7 +99,7 @@ class EmailTool(Tool):
         template: Literal["cold_outreach", "follow_up", "meeting_request", "none"] = "none",
     ) -> ToolResult:
 
-        if not self._yag:
+        if self._setup_error:
             return ToolResult(
                 status="error",
                 message=f"Email not configured: {self._setup_error}",
@@ -133,7 +111,16 @@ class EmailTool(Tool):
 
         def _send_blocking():
             """Runs in a thread pool — keeps event loop free."""
-            self._yag.send(to=to, subject=subject, contents=final_body)
+            msg = EmailMessage()
+            msg["From"] = Settings.GMAIL_USER
+            msg["To"] = to
+            msg["Subject"] = subject
+            msg.set_content(final_body)
+
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+                smtp.starttls()
+                smtp.login(Settings.GMAIL_USER, Settings.GMAIL_APP_PASSWORD)
+                smtp.send_message(msg)
 
         try:
             # KEY FIX: run the blocking SMTP call in a thread pool

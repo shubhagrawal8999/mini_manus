@@ -36,7 +36,8 @@ import aiohttp
 
 from bot.tools.base import Tool, ToolResult
 
-LINKEDIN_API_BASE = "https://api.linkedin.com/v2"
+LINKEDIN_API_BASE_V2 = "https://api.linkedin.com/v2"
+LINKEDIN_API_BASE_REST = "https://api.linkedin.com/rest"
 TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -148,8 +149,8 @@ class LinkedInTool(Tool):
 
         final_text = self._apply_template(content, template, hashtags or [])
 
-        # LinkedIn Share API v2 payload
-        payload = {
+        # LinkedIn UGC v2 payload (legacy but still supported for many apps)
+        payload_v2 = {
             "author": self._person_urn,
             "lifecycleState": "PUBLISHED",
             "specificContent": {
@@ -163,44 +164,76 @@ class LinkedInTool(Tool):
             },
         }
 
-        headers = {
+        headers_v2 = {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
             "X-Restli-Protocol-Version": "2.0.0",
         }
 
-        def _post_blocking():
-            """Synchronous fallback using urllib (no extra deps)."""
-            import urllib.request
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                f"{LINKEDIN_API_BASE}/ugcPosts",
-                data=data,
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.status, resp.read().decode()
+        # LinkedIn REST Posts API payload (newer)
+        payload_rest = {
+            "author": self._person_urn,
+            "commentary": final_text,
+            "visibility": "PUBLIC",
+            "distribution": {
+                "feedDistribution": "MAIN_FEED",
+                "targetEntities": [],
+                "thirdPartyDistributionChannels": [],
+            },
+            "lifecycleState": "PUBLISHED",
+            "isReshareDisabledByAuthor": False,
+        }
+        headers_rest = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+            "LinkedIn-Version": "202401",
+            "X-Restli-Protocol-Version": "2.0.0",
+        }
 
         try:
             async with aiohttp.ClientSession() as session:
+                # Try REST endpoint first
                 async with session.post(
-                    f"{LINKEDIN_API_BASE}/ugcPosts",
-                    headers=headers,
-                    json=payload,
+                    f"{LINKEDIN_API_BASE_REST}/posts",
+                    headers=headers_rest,
+                    json=payload_rest,
                     timeout=TIMEOUT,
                 ) as resp:
                     body = await resp.text()
-
                     if resp.status in (200, 201):
-                        post_id = json.loads(body).get("id", "unknown")
+                        parsed = json.loads(body) if body.strip() else {}
+                        post_id = parsed.get("id", "unknown")
                         return ToolResult(
                             status="success",
                             message="✅ LinkedIn post published successfully!",
-                            data={"post_id": post_id, "preview": final_text[:200]},
+                            data={
+                                "post_id": post_id,
+                                "api_version": "rest/posts",
+                                "preview": final_text[:200],
+                            },
                         )
+                    rest_error = f"REST /posts HTTP {resp.status}: {body[:300]}"
 
-                    # Token expired
+                # Fallback to v2 UGC endpoint
+                async with session.post(
+                    f"{LINKEDIN_API_BASE_V2}/ugcPosts",
+                    headers=headers_v2,
+                    json=payload_v2,
+                    timeout=TIMEOUT,
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status in (200, 201):
+                        parsed = json.loads(body) if body.strip() else {}
+                        post_id = parsed.get("id", "unknown")
+                        return ToolResult(
+                            status="success",
+                            message="✅ LinkedIn post published successfully!",
+                            data={
+                                "post_id": post_id,
+                                "api_version": "v2/ugcPosts",
+                                "preview": final_text[:200],
+                            },
+                        )
                     if resp.status == 401:
                         return ToolResult(
                             status="error",
@@ -208,14 +241,14 @@ class LinkedInTool(Tool):
                                 "LinkedIn token expired or invalid. "
                                 "Please refresh LINKEDIN_ACCESS_TOKEN."
                             ),
-                            error=f"HTTP 401: {body}",
+                            error=f"{rest_error} | v2/ugcPosts HTTP 401: {body[:300]}",
                             retryable=False,
                         )
 
                     return ToolResult(
                         status="error",
-                        message=f"LinkedIn API error (HTTP {resp.status}): {body[:300]}",
-                        error=body[:500],
+                        message="LinkedIn API rejected the request on both endpoints.",
+                        error=f"{rest_error} | v2/ugcPosts HTTP {resp.status}: {body[:300]}",
                         retryable=resp.status >= 500,
                     )
 

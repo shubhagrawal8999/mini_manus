@@ -35,6 +35,7 @@ class Orchestrator:
         messages = self._build_messages(context, message)
 
         tools_used: List[Dict] = []
+        tool_failures: List[str] = []
         total_cost: float = 0.0
         final_response: str = ""
 
@@ -63,12 +64,18 @@ class Orchestrator:
                         tool_params = json.loads(tool_call.function.arguments)
                     except json.JSONDecodeError as exc:
                         tool_params = {}
-                        print(f"[Orchestrator] Bad tool args JSON: {exc}")
+                        err = f"Tool '{tool_name}' had invalid JSON arguments: {exc}"
+                        tool_failures.append(err)
+                        print(f"[Orchestrator] {err}")
 
                     tool_result = await execute_tool(tool_name, tool_params)
                     tools_used.append(
                         {"tool": tool_name, "params": tool_params, "result": tool_result}
                     )
+                    if tool_result.get("status") in ("error", "partial"):
+                        tool_failures.append(
+                            f"{tool_name}: {tool_result.get('message', 'Tool failed')}"
+                        )
 
                     # Feed result back into conversation
                     messages.append(
@@ -106,6 +113,16 @@ class Orchestrator:
             final_response = (
                 "⚠️ I ran out of reasoning steps before finishing. "
                 "Please try rephrasing your request."
+            )
+
+        if not final_response and tool_failures:
+            final_response = (
+                "⚠️ I could not complete your request because one or more tools failed:\n- "
+                + "\n- ".join(tool_failures[:4])
+            )
+        elif final_response and tool_failures:
+            final_response += (
+                "\n\n⚠️ Tool diagnostics:\n- " + "\n- ".join(tool_failures[:3])
             )
 
         execution_time_ms = int((time.time() - start_time) * 1000)
@@ -149,7 +166,7 @@ Available tools:
 Rules:
 1. Use a tool when the user clearly wants an action (send, post, research, schedule).
 2. Respond directly for questions, conversation, or when no tool applies.
-3. If a tool fails, explain what went wrong and suggest an alternative.
+3. If a tool fails, explain exact failure reason (configuration, auth, validation, network).
 4. Be concise but complete.
 5. Today is {time.strftime('%A, %Y-%m-%d %H:%M:%S')}.
 
