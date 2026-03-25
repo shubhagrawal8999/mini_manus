@@ -5,6 +5,7 @@ Critical: Database file must be at /data/agent.db (Railway volume).
 
 import aiosqlite
 import json
+import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -24,6 +25,11 @@ class Memory:
         """Initialize tables if not exist."""
         if self._init_done:
             return
+
+        # Ensure parent directory exists (e.g. /data on Railway volume)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         
         async with aiosqlite.connect(self.db_path) as db:
             # Sessions: Current conversation context per user

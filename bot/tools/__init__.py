@@ -8,6 +8,7 @@ from bot.tools.email import EmailTool
 from bot.tools.whatsapp import WhatsAppTool
 from bot.tools.research import ResearchTool
 from bot.tools.schedule import ScheduleTool
+from bot.tools.linkedin import LinkedInTool
 
 # Registry - add new tools here
 TOOLS: Dict[str, Any] = {
@@ -15,6 +16,7 @@ TOOLS: Dict[str, Any] = {
     "send_whatsapp": WhatsAppTool(),
     "web_research": ResearchTool(),
     "schedule_task": ScheduleTool(),
+    "post_linkedin": LinkedInTool(),
     # Add new tools here - automatically available to LLM
 }
 
