@@ -1,18 +1,24 @@
 """
-Web research using aiohttp + BeautifulSoup.
+Web research using duckduckgo-search library.
 
-BUG FIXED:
-  Previous version used the synchronous `requests` library inside an
-  async function, blocking the entire event loop for every HTTP call.
-  Replaced with `aiohttp` for true non-blocking I/O.
+WHY THIS REPLACES THE OLD VERSION:
+  The old version scraped DuckDuckGo's HTML page directly.
+  DDG changes its HTML structure frequently and actively blocks scrapers.
+  This broke web search entirely — always returning "No results found".
+
+  Fix: use the `duckduckgo-search` pip package (DDGS class) which calls
+  DDG's internal API. No API key required. Reliable. Free.
+
+INSTALL:
+  pip install duckduckgo-search==6.3.7
 """
 
 import asyncio
-from typing import Dict, Any, List
-from urllib.parse import quote_plus
+from typing import Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 
 from bot.tools.base import Tool, ToolResult
 
@@ -24,9 +30,7 @@ HEADERS = {
     )
 }
 
-# How long to wait for DuckDuckGo / individual pages
-SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=12)
-PAGE_TIMEOUT = aiohttp.ClientTimeout(total=6)
+PAGE_TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 
 class ResearchTool(Tool):
@@ -60,7 +64,7 @@ class ResearchTool(Tool):
     async def _fetch_page_text(
         self, session: aiohttp.ClientSession, url: str
     ) -> str:
-        """Fetch a URL and return cleaned plain text (first 1 000 chars)."""
+        """Fetch a URL and return cleaned plain text (first 1000 chars)."""
         try:
             async with session.get(
                 url, headers=HEADERS, timeout=PAGE_TIMEOUT, ssl=False
@@ -77,6 +81,21 @@ class ResearchTool(Tool):
         except Exception as exc:
             return f"[Could not extract: {exc}]"
 
+    def _ddg_search(self, query: str, num_results: int) -> list[dict]:
+        """
+        Run DDGS search in a thread (it's synchronous).
+        Returns list of {title, url, snippet}.
+        """
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=num_results):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                })
+        return results
+
     async def execute(
         self,
         query: str,
@@ -86,46 +105,21 @@ class ResearchTool(Tool):
 
         num_results = min(max(num_results, 1), 5)
 
-        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-
         try:
-            async with aiohttp.ClientSession() as session:
-                # ── 1. Fetch search results ──────────────────────────────
-                async with session.post(
-                    search_url,
-                    headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=SEARCH_TIMEOUT,
-                ) as resp:
-                    html_body = await resp.text(errors="replace")
+            # DDGS is synchronous — run in thread pool to avoid blocking event loop
+            parsed = await asyncio.to_thread(self._ddg_search, query, num_results)
 
-                soup = BeautifulSoup(html_body, "html.parser")
-                raw_results = soup.find_all("div", class_="result")[:num_results]
+            if not parsed:
+                return ToolResult(
+                    status="error",
+                    message=f"No results found for: '{query}'",
+                    error="zero_results",
+                    retryable=True,
+                )
 
-                if not raw_results:
-                    return ToolResult(
-                        status="error",
-                        message="No results found. DuckDuckGo may have changed its HTML structure.",
-                        error="zero_results",
-                        retryable=True,
-                    )
-
-                # ── 2. Parse result cards ────────────────────────────────
-                parsed: list[dict] = []
-                for r in raw_results:
-                    title_el = r.find("a", class_="result__a")
-                    if not title_el:
-                        continue
-                    snippet_el = r.find("a", class_="result__snippet")
-                    parsed.append(
-                        {
-                            "title": title_el.get_text(strip=True),
-                            "url": title_el.get("href", ""),
-                            "snippet": snippet_el.get_text(strip=True) if snippet_el else "",
-                        }
-                    )
-
-                # ── 3. Optionally fetch page content in parallel ─────────
-                if extract_content:
+            # Optionally fetch full page content in parallel
+            if extract_content:
+                async with aiohttp.ClientSession() as session:
                     tasks = [
                         self._fetch_page_text(session, r["url"])
                         for r in parsed
