@@ -1,18 +1,20 @@
+# src/main.py (corrected)
 from fastapi import FastAPI, Request, Response
 from src.config import Config
 from src.memory import MemoryManager
 from src.router import IntentRouter
 from src.executor import ActionExecutor
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import json
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 memory = MemoryManager()
 router = IntentRouter(memory)
 executor = ActionExecutor(memory)
 
-# Telegram bot instance (lazy init)
 bot_app = None
 
 @app.on_event("startup")
@@ -21,12 +23,14 @@ async def startup():
     global bot_app
     bot_app = Application.builder().token(Config.TELEGRAM_TOKEN).build()
     await bot_app.initialize()
-    # Register commands
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("help", help_command))
-    # Message handler
-    from telegram.ext import MessageHandler, filters
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+@app.on_event("shutdown")
+async def shutdown():
+    if bot_app:
+        await bot_app.shutdown()
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("AI Agent with memory ready. Send me a task like 'post on LinkedIn ...'")
@@ -54,8 +58,3 @@ async def webhook(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-# For local testing with polling (not used on Railway)
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
