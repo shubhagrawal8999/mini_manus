@@ -1,6 +1,7 @@
 from src.plugins.base import ActionPlugin
 from src.models import ActionResult
 import httpx
+from src.config import Config
 
 class LinkedInPlugin(ActionPlugin):
     name = "linkedin"
